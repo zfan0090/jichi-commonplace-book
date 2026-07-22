@@ -1,0 +1,53 @@
+# Simulation code — four models, ordered by how much of the data is real
+
+These scripts operationalize a critique developed while reading Lau, Liu
+& Ma (2024), *Blockchain-Based Messaging and Information Sharing Systems
+for Air Cargo Supply Chains* (IEEE TEM, Vol. 71): the paper argues its
+system is technically sound (Sections III–IV) and makes sense under four
+management theories (Section V), but never tests whether it would
+actually be *adopted*, nor does it measure real cost/latency/reliability
+— it says so itself in Section VII's future-work list.
+
+Each model below is labeled with a **data provenance** rating so it's
+always clear which numbers come from the paper and which are illustrative
+assumptions built to make the model runnable.
+
+| # | Script | Question it answers | Data provenance |
+|---|---|---|---|
+| A | `01_transaction_cost_model.py` | How does the paper's own per-message cost figure scale with volume, and how much hidden infrastructure cost would erase its advantage? | **High** — core numbers stated directly in Section V-B |
+| B | `02_message_latency_model.py` | How much faster / more reliable is broadcast notification vs. sequential peer-to-peer relay? | **Mixed** — block time (3.6s) is real (Section IV-A); hop delays & error rates are illustrative assumptions the paper never measured |
+| C | `03_adoption_model.py` | Would a heterogeneous industry actually adopt the system, organically or only under a mandate/subsidy? | **Assumption-driven** — fills a gap the paper never addresses at all; parameters are illustrative, not fitted to real data |
+| D | `04_coordination_game.py` | Why can a system be "better for everyone" and still not get adopted? | **Illustrative / textbook** — a minimal 2×2 game, not fitted to any data |
+
+## Running all four
+
+```bash
+pip install -r requirements.txt
+
+python3 01_transaction_cost_model.py      # -> assets/img/model_a_*.png
+python3 02_message_latency_model.py       # -> assets/img/model_b_*.png
+python3 03_adoption_model.py              # -> assets/img/adoption_*.png
+python3 04_coordination_game.py           # prints to console only
+```
+
+## Why these four, in this order
+
+**A** is the only model here that is *mostly just arithmetic on the
+paper's own numbers* — it establishes the one part of the paper's
+argument that is directly verifiable. **B** takes the paper's one real
+performance number (block time) and asks what it would imply if paired
+with reasonable, clearly-labeled assumptions about the traditional
+alternative — useful, but honestly only half real. **C** and **D** step
+outside the paper entirely, because the paper's central unexamined claim
+— "the system's advantages can't be realized until stakeholders adopt
+it" (Section VI-B, paraphrased) — is a network-externality / coordination
+problem that the paper describes in prose but never analyzes formally.
+
+## Shared honesty note
+
+Nothing here is a rebuttal of the paper's technical design. All four
+models are compatible with "the system, if built, would work as
+described." What they test is the separate, harder question the paper
+raises but does not answer: **given real-world cost asymmetry, unclear
+governance, and a network good's chicken-and-egg problem, does the
+system get built and used at all?**

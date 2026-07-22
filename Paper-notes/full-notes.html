@@ -1,0 +1,349 @@
+"""
+adoption_model.py
+
+An agent-based simulation of whether the blockchain-based messaging system
+proposed in Lau, Liu & Ma (2024), "Blockchain-Based Messaging and Information
+Sharing Systems for Air Cargo Supply Chains" (IEEE TEM, Vol. 71), would
+actually be ADOPTED by a fragmented, heterogeneous set of air cargo
+stakeholders -- a question the original paper argues for qualitatively
+(Sections V and VI) but never tests computationally.
+
+Core idea being tested
+-----------------------
+The paper's argument is essentially:
+    "The system is technically superior (Section III) and makes economic
+     sense under four management theories (Section V) -> therefore
+     stakeholders should adopt it."
+
+This script operationalizes the missing step: the paper's own text
+acknowledges that "the advantages of streamlining message flow cannot be
+achieved until the related receiver stakeholders have adopted the solution"
+(Section VI-B) -- i.e. the system's value is a NETWORK GOOD. Whether a
+network good tips into wide adoption or stalls at low adoption depends on
+the distribution of switching costs, the size of network externalities,
+and whether any intermediary actively resists it -- not on whether the
+technology "works."
+
+We simulate a population of stakeholders with heterogeneous adoption
+costs and benefits (mirroring the paper's own taxonomy: large airlines,
+large freight forwarders, small freight forwarders, customs brokers, and
+incumbent messaging service providers / intermediaries who stand to lose
+their position), and see whether adoption reaches a high equilibrium
+under different real-world-style interventions:
+
+    1. baseline       -- pure organic, self-interested adoption
+    2. mandate        -- IATA-style mandate forcing large players to adopt
+    3. subsidy        -- external subsidy lowering small players' cost
+    4. mandate+subsidy-- both combined
+
+Data used from the paper (paraphrased / reconstructed, not fabricated)
+------------------------------------------------------------------------
+The paper states (Section V-B):
+    - one Algorand transaction costs about 0.001 Algo (~USD 0.0003)
+    - a complete send-and-acknowledge cycle uses 4 Algorand transactions
+    - the blockchain cost is "less than half" the cost of SFTP and
+      "less than one tenth" the cost of AS2 (the exact SFTP/AS2 dollar
+      figures were in a table image not available as extracted text, so
+      here we back out ILLUSTRATIVE lower bounds implied by those stated
+      ratios -- these are clearly marked as reconstructed, not the
+      original table's exact numbers).
+
+This script does not claim to reproduce the paper's Table III exactly;
+it uses the paper's stated cost RATIOS to build a directionally faithful,
+labeled reconstruction, purely to ground the simulation's cost parameters
+in something the paper actually said, rather than inventing numbers from
+nothing.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+from typing import Callable
+
+rng = np.random.default_rng(42)
+
+# ---------------------------------------------------------------------------
+# 1. Reconstructing the paper's own cost figures (Section V-B / Table III)
+# ---------------------------------------------------------------------------
+
+BLOCKCHAIN_COST_PER_TXN_USD = 0.0003          # stated directly in the paper
+TXNS_PER_MESSAGE = 4                          # stated directly in the paper
+blockchain_cost_per_message = BLOCKCHAIN_COST_PER_TXN_USD * TXNS_PER_MESSAGE
+
+# The paper states blockchain cost is "less than half" of SFTP and
+# "less than one tenth" of AS2. We reconstruct illustrative values that
+# satisfy those stated inequalities (NOT the paper's original numbers,
+# which were only shown in a table image):
+sftp_cost_per_message = blockchain_cost_per_message * 2.4     # > 2x blockchain
+as2_cost_per_message = blockchain_cost_per_message * 11.0     # > 10x blockchain
+
+print("=== Reconstructed per-message transaction costs (USD) ===")
+print(f"Blockchain system : {blockchain_cost_per_message:.5f}")
+print(f"SFTP (illustrative reconstruction from stated ratio): {sftp_cost_per_message:.5f}")
+print(f"AS2  (illustrative reconstruction from stated ratio): {as2_cost_per_message:.5f}")
+print()
+
+# ---------------------------------------------------------------------------
+# 2. Stakeholder archetypes
+# ---------------------------------------------------------------------------
+# Proportions loosely inspired by the paper's own numbers (Section I):
+# "over 40,000 freight forwarders, more than 450 airlines, and 23 third
+# party messaging service providers". We do not simulate 40,000 literal
+# agents -- we simulate a representative population with realistic
+# RELATIVE proportions, which is what actually matters for the dynamics.
+
+@dataclass
+class StakeholderType:
+    name: str
+    share: float                 # fraction of the population this type represents
+    cost_mean: float              # mean one-off switching/integration cost (USD, illustrative)
+    cost_sd: float                 # heterogeneity in switching cost within the type
+    benefit_per_partner: float    # marginal benefit per adopting partner (network externality)
+    resistance: float = 0.0        # extra disutility from adopting (e.g. loses intermediary role)
+    color: str = "#8B96AC"
+
+STAKEHOLDER_TYPES = [
+    StakeholderType(
+        name="Large airline",
+        share=0.02,
+        cost_mean=40_000, cost_sd=8_000,
+        benefit_per_partner=1200,
+        resistance=0.0,
+        color="#F5A623",
+    ),
+    StakeholderType(
+        name="Large freight forwarder",
+        share=0.08,
+        cost_mean=25_000, cost_sd=6_000,
+        benefit_per_partner=900,
+        resistance=0.0,
+        color="#4ADE80",
+    ),
+    StakeholderType(
+        name="Small freight forwarder",
+        share=0.75,
+        cost_mean=15_000, cost_sd=5_000,
+        benefit_per_partner=250,
+        resistance=0.0,
+        color="#5B8DEF",
+    ),
+    StakeholderType(
+        name="Customs broker",
+        share=0.10,
+        cost_mean=18_000, cost_sd=4_000,
+        benefit_per_partner=400,
+        resistance=0.0,
+        color="#C084FC",
+    ),
+    StakeholderType(
+        name="Incumbent messaging intermediary",
+        share=0.05,
+        cost_mean=20_000, cost_sd=3_000,
+        benefit_per_partner=150,     # gets little upside -- the system disintermediates them
+        resistance=35_000,           # loses fee revenue from being the "middleman"
+        color="#F87171",
+    ),
+]
+
+N_AGENTS = 2000
+
+
+@dataclass
+class Agent:
+    type_name: str
+    cost: float
+    benefit_per_partner: float
+    resistance: float
+    color: str
+    adopted: bool = False
+    adopted_round: int = -1
+
+
+def build_population(n_agents=N_AGENTS, seed=42):
+    local_rng = np.random.default_rng(seed)
+    agents = []
+    for t in STAKEHOLDER_TYPES:
+        n_of_type = int(round(t.share * n_agents))
+        costs = local_rng.normal(t.cost_mean, t.cost_sd, n_of_type).clip(min=1000)
+        for c in costs:
+            agents.append(Agent(
+                type_name=t.name,
+                cost=c,
+                benefit_per_partner=t.benefit_per_partner,
+                resistance=t.resistance,
+                color=t.color,
+            ))
+    local_rng.shuffle(agents)
+    return agents
+
+
+# ---------------------------------------------------------------------------
+# 3. Diffusion dynamics
+# ---------------------------------------------------------------------------
+# Each round, a non-adopted agent computes:
+#     expected_value = benefit_per_partner * (fraction_adopted * NETWORK_SCALE)
+#                       - cost - resistance - subsidy_reduction
+# and adopts if expected_value > 0.
+#
+# fraction_adopted is a simple proxy for "how much of the network I could
+# talk to has already joined" -- this is what makes the system a NETWORK
+# GOOD: value scales with how many others have already adopted, not with
+# the technology's intrinsic quality.
+
+NETWORK_SCALE = 300   # converts "fraction adopted" into an addressable-partner-count proxy
+                       # (i.e. "if 100% of the industry had adopted, how many
+                       # relevant partners would a typical agent be messaging?")
+
+
+def run_simulation(
+    n_rounds=30,
+    n_agents=N_AGENTS,
+    seed_fraction=0.01,     # innovators who adopt round 0 regardless (e.g. Cathay Pacific-style early movers)
+    mandate=False,          # force "Large airline" + "Large freight forwarder" to adopt by round 5
+    mandate_round=5,
+    subsidy=0.0,            # fraction of cost subsidized for "Small freight forwarder"
+    seed=42,
+):
+    agents = build_population(n_agents=n_agents, seed=seed)
+    local_rng = np.random.default_rng(seed + 1)
+
+    # seed innovators (mirrors real anecdote in the paper: Cathay Pacific,
+    # GMR Hyderabad etc. already piloting blockchain voluntarily)
+    n_seed = max(1, int(seed_fraction * len(agents)))
+    seed_idx = local_rng.choice(len(agents), size=n_seed, replace=False)
+    for i in seed_idx:
+        agents[i].adopted = True
+        agents[i].adopted_round = 0
+
+    history = []  # list of dicts: round -> fraction adopted overall + per type
+
+    for rnd in range(n_rounds):
+        n_adopted = sum(a.adopted for a in agents)
+        fraction_adopted = n_adopted / len(agents)
+
+        # record before this round's decisions
+        per_type = {}
+        for t in STAKEHOLDER_TYPES:
+            members = [a for a in agents if a.type_name == t.name]
+            per_type[t.name] = sum(a.adopted for a in members) / max(1, len(members))
+        history.append({"round": rnd, "fraction_adopted": fraction_adopted, **per_type})
+
+        if mandate and rnd == mandate_round:
+            for a in agents:
+                if a.type_name in ("Large airline", "Large freight forwarder"):
+                    a.adopted = True
+                    a.adopted_round = rnd
+
+        for a in agents:
+            if a.adopted:
+                continue
+            effective_cost = a.cost
+            if subsidy > 0 and a.type_name == "Small freight forwarder":
+                effective_cost *= (1 - subsidy)
+
+            expected_value = (
+                a.benefit_per_partner * fraction_adopted * NETWORK_SCALE
+                - effective_cost
+                - a.resistance
+            )
+            if expected_value > 0:
+                a.adopted = True
+                a.adopted_round = rnd
+
+    n_adopted_final = sum(a.adopted for a in agents)
+    history.append({
+        "round": n_rounds,
+        "fraction_adopted": n_adopted_final / len(agents),
+        **{t.name: sum(a.adopted for a in agents if a.type_name == t.name) /
+           max(1, len([a for a in agents if a.type_name == t.name]))
+           for t in STAKEHOLDER_TYPES}
+    })
+    return agents, history
+
+
+# ---------------------------------------------------------------------------
+# 4. Scenarios
+# ---------------------------------------------------------------------------
+
+SCENARIOS = {
+    "1. Baseline (organic adoption)": dict(mandate=False, subsidy=0.0),
+    "2. IATA-style mandate for large players": dict(mandate=True, subsidy=0.0),
+    "3. Subsidy for small forwarders (40%)": dict(mandate=False, subsidy=0.4),
+    "4. Mandate + subsidy combined": dict(mandate=True, subsidy=0.4),
+}
+
+def _apply_dark_style():
+    """Match the companion website's visual theme (deep navy / amber / slate)."""
+    plt.rcParams.update({
+        "figure.facecolor": "#0B1220",
+        "axes.facecolor": "#0B1220",
+        "savefig.facecolor": "#0B1220",
+        "axes.edgecolor": "#3A4560",
+        "axes.labelcolor": "#E8ECF2",
+        "xtick.color": "#8B96AC",
+        "ytick.color": "#8B96AC",
+        "text.color": "#E8ECF2",
+        "axes.titlecolor": "#E8ECF2",
+        "grid.color": "#232D42",
+        "font.family": "sans-serif",
+        "font.size": 11,
+    })
+
+
+if __name__ == "__main__":
+    _apply_dark_style()
+    results = {}
+    for name, kwargs in SCENARIOS.items():
+        _, history = run_simulation(**kwargs)
+        results[name] = history
+        final = history[-1]["fraction_adopted"]
+        print(f"{name:45s} -> final adoption = {final:5.1%}")
+
+    # ---- Plot 1: overall adoption curves under each scenario -------------
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    colors = ["#8B96AC", "#F5A623", "#5B8DEF", "#4ADE80"]
+    for (name, history), c in zip(results.items(), colors):
+        rounds = [h["round"] for h in history]
+        frac = [h["fraction_adopted"] for h in history]
+        ax.plot(rounds, frac, label=name, linewidth=2.5, color=c)
+    ax.set_xlabel("Simulated round (roughly: quarters of industry activity)")
+    ax.set_ylabel("Fraction of stakeholders adopted")
+    ax.set_title("Does the system reach wide adoption? Depends on the mechanism, not the tech.")
+    ax.set_ylim(0, 1.02)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig("../assets/img/adoption_curves.png", dpi=160)
+    print("Saved ../assets/img/adoption_curves.png")
+
+    # ---- Plot 2: per-type adoption breakdown, baseline scenario ----------
+    _, baseline_history = run_simulation(**SCENARIOS["1. Baseline (organic adoption)"])
+    fig2, ax2 = plt.subplots(figsize=(9, 5.5))
+    for t in STAKEHOLDER_TYPES:
+        rounds = [h["round"] for h in baseline_history]
+        frac = [h[t.name] for h in baseline_history]
+        ax2.plot(rounds, frac, label=t.name, linewidth=2.5, color=t.color)
+    ax2.set_xlabel("Simulated round")
+    ax2.set_ylabel("Fraction of that stakeholder type adopted")
+    ax2.set_title("Baseline scenario: adoption is deeply unequal across stakeholder types")
+    ax2.set_ylim(0, 1.02)
+    ax2.legend(loc="upper left", fontsize=9)
+    ax2.grid(alpha=0.25)
+    fig2.tight_layout()
+    fig2.savefig("../assets/img/adoption_by_type.png", dpi=160)
+    print("Saved ../assets/img/adoption_by_type.png")
+
+    # ---- Plot 3: reconstructed transaction cost comparison ---------------
+    fig3, ax3 = plt.subplots(figsize=(7, 5))
+    labels = ["Blockchain\n(stated in paper)", "SFTP\n(reconstructed)", "AS2\n(reconstructed)"]
+    values = [blockchain_cost_per_message, sftp_cost_per_message, as2_cost_per_message]
+    bars = ax3.bar(labels, values, color=["#4ADE80", "#5B8DEF", "#F87171"])
+    ax3.set_ylabel("USD per message (illustrative)")
+    ax3.set_title("Per-message cost: paper's stated figure vs. reconstructed ratios")
+    for b, v in zip(bars, values):
+        ax3.text(b.get_x() + b.get_width() / 2, v, f"${v:.4f}", ha="center", va="bottom", fontsize=9)
+    fig3.tight_layout()
+    fig3.savefig("../assets/img/cost_comparison.png", dpi=160)
+    print("Saved ../assets/img/cost_comparison.png")
+
+    print("\nDone. Three charts written to ../assets/img/")
